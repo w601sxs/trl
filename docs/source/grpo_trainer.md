@@ -71,6 +71,7 @@ This approach gives the method its name: **Group Relative Policy Optimization (G
 
 > [!TIP]
 > It was shown in the paper [Understanding R1-Zero-Like Training: A Critical Perspective](https://huggingface.co/papers/2503.20783) that scaling by  \\( \text{std}(\mathbf{r}) \\) may cause a question-level difficulty bias. You can disable this scaling by setting `scale_rewards=False` in [`GRPOConfig`].
+> Note that turning off std-based scaling also removes variance normalization, so update magnitudes depend directly on the raw reward scale and batch composition.
 
 > [!TIP]
 > As shown in [Part I: Tricks or Traps? A Deep Dive into RL for LLM Reasoning (Lite PPO)](https://huggingface.co/papers/2508.08221), calculating the mean at the local (group) level and the standard deviation at the global (batch) level enables more robust reward shaping. You can use this scaling strategy by setting `scale_rewards="batch"` in [`GRPOConfig`].
@@ -160,7 +161,7 @@ $$
 \end{cases}
 $$
 
-They recommends using asymmetric temperatures,  \\( \tau_{\text{neg}} > \tau_{\text{pos}} \\) (defaults are  \\( \tau_{\text{pos}}=1.0, \tau_{\text{neg}}=1.05 \\) ). This ensures that the model is penalized more strictly for "bad" actions to prevent instability, while being more permissive with "good" actions.
+They recommend using asymmetric temperatures,  \\( \tau_{\text{neg}} > \tau_{\text{pos}} \\) (defaults are  \\( \tau_{\text{pos}}=1.0, \tau_{\text{neg}}=1.05 \\) ). This ensures that the model is penalized more strictly for "bad" actions to prevent instability, while being more permissive with "good" actions.
 
 To use this formulation, set `loss_type="sapo"` in the [`GRPOConfig`].
 
@@ -179,10 +180,8 @@ While training and evaluating, we record the following reward metrics:
 - `completions/clipped_ratio`: The ratio of truncated (clipped) completions.
 - `reward/{reward_func_name}/mean`: The average reward from a specific reward function.
 - `reward/{reward_func_name}/std`: The standard deviation of the reward from a specific reward function.
-- `reward`: The overall average reward after applying reward weights.
-- `reward_std`: The standard deviation of rewards after applying reward weights.  
-  - If `scale_rewards` is `"group"` or `"none"`, this is the average of the per-group standard deviations.
-  - If `scale_rewards` is `"batch"`, this is the standard deviation computed over all rewards in the batch (ignoring groups).
+- `reward`: The overall average reward after summing rewards across functions (weighted by `reward_weights`).
+- `reward_std`: The standard deviation of summed rewards across functions (weighted by `reward_weights`), computed over the full batch.
 - `frac_reward_zero_std`: The fraction of samples in the generation batch with a reward std of zero, implying there is little diversity for that prompt (all answers are correct or incorrect).
 - `entropy`: Average entropy of token predictions across generated completions. (If `mask_truncated_completions=True`, masked sequences tokens are excluded.)
 - `kl`: The average KL divergence between the model and the reference model, calculated over generated completions. Logged only if `beta` is nonzero.
@@ -207,7 +206,20 @@ We support two ways of using vLLM during training: **server mode** and **colocat
 > [!TIP]
 > By default, Truncated Importance Sampling is activated for vLLM generation to address the generation-training mismatch that occurs when using different frameworks. This can be turned off by setting `vllm_importance_sampling_correction=False`. For more information, see [Truncated Importance Sampling](paper_index#truncated-importance-sampling)
 
-#### 🔌 Option 1: Server mode
+#### Option 1: Colocate mode
+
+In this mode, vLLM runs inside the trainer process and shares GPU memory with the training model. This avoids launching a separate server and can improve GPU utilization, but may lead to memory contention on the training GPUs. This is the default mode.
+
+```python
+from trl import GRPOConfig
+
+training_args = GRPOConfig(
+    ...,
+    use_vllm=True,  # vllm_mode="colocate" by default
+)
+```
+
+#### Option 2: Server mode
 
 In this mode, vLLM runs in a separate process (and using separate GPUs) and communicates with the trainer via HTTP. This is ideal if you have dedicated GPUs for inference.
 
@@ -225,26 +237,12 @@ In this mode, vLLM runs in a separate process (and using separate GPUs) and comm
    training_args = GRPOConfig(
        ...,
        use_vllm=True,
-       vllm_mode="server",  # default value, can be omitted
+       vllm_mode="server",
    )
    ```
 
 > [!WARNING]
 > Make sure that the server is using different GPUs than the trainer, otherwise you may run into NCCL errors. You can specify the GPUs to use with the `CUDA_VISIBLE_DEVICES` environment variable.
-
-#### 🧩 Option 2: Colocate mode
-
-In this mode, vLLM runs inside the trainer process and shares GPU memory with the training model. This avoids launching a separate server and can improve GPU utilization, but may lead to memory contention on the training GPUs.
-
-```python
-from trl import GRPOConfig
-
-training_args = GRPOConfig(
-    ...,
-    use_vllm=True,
-    vllm_mode="colocate",
-)
-```
 
 > [!TIP]
 > Depending on the model size and the overall GPU memory requirements for training, you may need to adjust the `vllm_gpu_memory_utilization` parameter in [`GRPOConfig`] to avoid underutilization or out-of-memory errors.
@@ -350,6 +348,7 @@ def main():
     training_args = GRPOConfig(
         per_device_train_batch_size=4,
         use_vllm=True,
+        vllm_mode="server",
         vllm_server_host=args.vllm_server_host.replace("ip-", "").replace("-", "."),  # from ip-X-X-X-X to X.X.X.X
     )
 
@@ -375,8 +374,11 @@ Reward functions can be either synchronous Python callables or asynchronous `asy
    - The function must accept the following as keyword arguments:
      - `prompts` (contains the prompts),
      - `completions` (contains the generated completions),
-     - `completions_ids` (contains the tokenized completions),
+     - `completion_ids` (contains the tokenized completions),
      - `trainer_state` ([`~transformers.TrainerState`]): The current state of the trainer. This can be used to implement dynamic reward functions, such as curriculum learning, where the reward is adjusted based on the training progress.
+     - `log_extra`: a callable `log_extra(column: str, values: list)` to add extra columns to the completions table. See Example 6. In distributed training, it's important that all processes log the same set of keys.
+     - `log_metric`: a callable `log_metric(name: str, value: float)` to log scalar metrics as plots alongside `kl`, `entropy`, etc. See Example 6. In distributed training, it's important that all processes log the same set of keys.
+     - `environments`: a list of environment instances, one per completion. Only present when `environment_factory` is provided. Use this to read state accumulated during the episode (e.g., `env.reward`).
      - All column names (but `prompt`) that the dataset may have. For example, if the dataset contains a column named `ground_truth`, the function will be called with `ground_truth` as a keyword argument.
 
      The easiest way to comply with this requirement is to use `**kwargs` in the function signature.
@@ -391,9 +393,9 @@ Reward functions can be either synchronous Python callables or asynchronous `asy
 Below is an example of a reward function for a standard format that rewards longer completions:
 
 ```python
-def reward_func(completions_ids, **kwargs):
+def reward_func(completion_ids, **kwargs):
     """Reward function that assigns higher scores to longer completions (in terms of token count)."""
-    return [float(len(ids)) for ids in completions_ids]
+    return [float(len(ids)) for ids in completion_ids]
 ```
 
 You can test it as follows:
@@ -401,8 +403,8 @@ You can test it as follows:
 ```python
 >>> prompts = ["The sky is", "The sun is"]  # not used in the reward function, but the trainer will pass it
 >>> completions = [" blue.", " in the sky."]  # not used in the reward function, but the trainer will pass it
->>> completions_ids = [[6303, 13], [304, 279, 12884, 13]]
->>> reward_func(prompts=prompts, completions=completions, completions_ids=completions_ids)
+>>> completion_ids = [[6303, 13], [304, 279, 12884, 13]]
+>>> reward_func(prompts=prompts, completions=completions, completion_ids=completion_ids)
 [2.0, 4.0]
 ```
 
@@ -421,8 +423,8 @@ You can test it as follows:
 ```python
 >>> prompts = ["The sky is", "The sun is"]
 >>> completions = [" blue.", " in the sky."]
->>> completions_ids = [[6303, 13], [304, 279, 12884, 13]]  # not used in the reward function, but the trainer will pass it
->>> reward_func(prompts=prompts, completions=completions, completions_ids=completions_ids)
+>>> completion_ids = [[6303, 13], [304, 279, 12884, 13]]  # not used in the reward function, but the trainer will pass it
+>>> reward_func(prompts=prompts, completions=completions, completion_ids=completion_ids)
 [6.0, 12.0]
 ```
 
@@ -559,6 +561,28 @@ async def async_reward_func(prompts, completions, **kwargs):
     return [1.0 if completion else 0.0 for completion in completions]
 ```
 
+#### Example 6: Logging extra columns and metrics
+
+Below is an example of a reward function that logs extra columns to the completions table and scalar metrics as plots.
+
+```python
+import re
+
+def reward_func(completions, ground_truth, log_extra=None, log_metric=None, **kwargs):
+    extracted = [re.search(r"\\boxed\{(.*?)\}", c) for c in completions]
+    extracted = [m.group(1) if m else None for m in extracted]
+    rewards = [1.0 if e == gt else 0.0 for e, gt in zip(extracted, ground_truth)]
+
+    if log_extra:
+        log_extra("golden_answer", list(ground_truth))
+        log_extra("extracted_answer", [e or "[none]" for e in extracted])
+
+    if log_metric:
+        log_metric("accuracy", sum(rewards) / len(rewards))
+
+    return rewards
+```
+
 #### Passing the reward function to the trainer
 
 To use your custom reward function, pass it to the [`GRPOTrainer`] as follows:
@@ -594,7 +618,7 @@ RapidFire AI is an open-source experimentation engine that sits on top of TRL an
 ## Agent Training
 
 GRPO supports **agent training** through the `tools` argument in [`GRPOTrainer`].
-This parameter expects a list of Python functions that define the tools available to the agent:
+This parameter expects a list of Python functions (sync or async) that define the tools available to the agent:
 
 ```python
 from trl import GRPOTrainer
@@ -626,17 +650,78 @@ def multiply(a: int, b: int) -> int:
     """
     return a * b
 
+async def async_add(a: int, b: int) -> int:
+    """
+    Asynchronously adds two integers.
+
+    Args:
+        a: The first integer.
+        b: The second integer.
+
+    Returns:
+        The sum of the two integers.
+    """
+    return a + b
+
 trainer = GRPOTrainer(
-    tools=[multiply],
+    tools=[multiply, async_add],
     ...,
 )
 ```
+
+You can also provide tools through `environment_factory`. In this mode, [`GRPOTrainer`] creates one environment instance per rollout and exposes the environment's public methods as tools.
+
+> [!IMPORTANT]
+> `environment_factory` requires `transformers>=5.2.0`.
+
+The following is a minimal example of using `environment_factory` to define a simple environment with an `increment` method, which is exposed as a tool to the agent:
+
+```python
+from datasets import Dataset
+from trl import GRPOConfig, GRPOTrainer
+
+instructions = [f"Increment the counter by {i}." for i in range(1, 7)]
+dataset = Dataset.from_dict({"prompt": [[{"role": "user", "content": instruction}] for instruction in instructions]})
+
+def reward_func(environments, **kwargs):  # dummy reward: the reward is the current value of the counter
+    return [environment.counter for environment in environments]
+
+class IncrementEnv:
+    def reset(self, **kwargs) -> str | None:  # required; receives sampled row fields as kwargs (e.g., `prompt`)
+        self.counter = 0
+        return "Counter reset to 0.\n"
+
+    def increment(self, step: int) -> int:  # the other public methods of the environment are exposed as tools
+        """
+        Increment the internal counter.
+
+        Args:
+            step: Value to add to the counter.
+
+        Returns:
+            The updated counter value.
+        """
+        self.counter += step
+        return self.counter
+
+trainer = GRPOTrainer(
+    model="Qwen/Qwen3-0.6B",
+    args=GRPOConfig(chat_template_kwargs={"enable_thinking": False}),
+    train_dataset=dataset,
+    reward_funcs=reward_func,
+    environment_factory=IncrementEnv,
+)
+trainer.train()
+```
+
+`reset` can return either `None` or a string. In GRPO, when it returns a string, that string is appended to the last user message before generation.
 
 ### Supported Models
 
 Tested with:
 
-- **Qwen3** — e.g., `Qwen/Qwen3-0.6B`
+- [**Qwen3**](https://huggingface.co/collections/Qwen/qwen3) — e.g., `Qwen/Qwen3-0.6B`
+- [**Qwen3.5**](https://huggingface.co/collections/Qwen/qwen35) — e.g., `Qwen/Qwen3.5-2B`
 
 > [!TIP]
 > Compatibility with all LLMs is not guaranteed. If you believe a model should be supported, feel free to open an issue on GitHub — or better yet, submit a pull request with the required changes.
@@ -681,7 +766,6 @@ accelerate launch \
   --model_name_or_path Qwen/Qwen2.5-VL-3B-Instruct \
   --output_dir grpo-Qwen2.5-VL-3B-Instruct \
   --learning_rate 1e-5 \
-  --gradient_checkpointing \
   --dtype bfloat16 \
   --max_completion_length 1024 \
   --use_vllm \

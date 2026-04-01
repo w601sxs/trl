@@ -1,4 +1,4 @@
-# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ from transformers.utils import is_peft_available
 
 from trl.experimental.nash_md import NashMDConfig, NashMDTrainer
 from trl.experimental.nash_md.nash_md_trainer import GeometricMixtureWrapper
-from trl.models.utils import create_reference_model
+from trl.experimental.utils import create_reference_model
 
 from ..testing_utils import TrlTestCase, require_llm_blender, require_peft
 from .testing_utils import RandomPairwiseJudge
@@ -34,7 +34,7 @@ class TestGeometricMixtureWrapper(TrlTestCase):
     def setup_method(self):
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = AutoModelForCausalLM.from_pretrained(model_id).to(self.device)
+        self.model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32").to(self.device)
         self.ref_model = create_reference_model(self.model).to(self.device)
         self.generation_config = GenerationConfig.from_pretrained(model_id)
         self.mixture_coef = 0.5
@@ -65,7 +65,7 @@ class TestGeometricMixtureWrapper(TrlTestCase):
             self.mixture_coef * ref_model_output.logits + (1 - self.mixture_coef) * model_output.logits, dim=-1
         )
 
-        assert torch.allclose(wrapper_output.logits, expected_logits, atol=1e-5)
+        torch.testing.assert_close(wrapper_output.logits, expected_logits)
 
     def test_prepare_inputs_for_generation(self):
         input_ids = torch.tensor([[1, 2, 3, 4, 5]], device=self.device)
@@ -81,7 +81,7 @@ class TestGeometricMixtureWrapper(TrlTestCase):
 class TestNashMDTrainer(TrlTestCase):
     def setup_method(self):
         self.model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_id)
+        self.model = AutoModelForCausalLM.from_pretrained(self.model_id, dtype="float32")
         self.ref_model = AutoModelForCausalLM.from_pretrained(self.model_id)
         self.reward_model = AutoModelForSequenceClassification.from_pretrained(self.model_id, num_labels=1)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
@@ -96,7 +96,6 @@ class TestNashMDTrainer(TrlTestCase):
             remove_unused_columns=False,
             gradient_accumulation_steps=1,
             learning_rate=9e-1,
-            eval_strategy="steps",
             report_to="none",
         )
         dummy_dataset = load_dataset("trl-internal-testing/zen", config_name)
@@ -108,7 +107,6 @@ class TestNashMDTrainer(TrlTestCase):
             args=training_args,
             processing_class=self.tokenizer,
             train_dataset=dummy_dataset["train"],
-            eval_dataset=dummy_dataset["test"],
         )
 
         trainer.train()
@@ -124,7 +122,6 @@ class TestNashMDTrainer(TrlTestCase):
             per_device_train_batch_size=2,
             max_steps=3,
             learning_rate=5.0e-7,
-            eval_strategy="steps",
             report_to="none",
         )
         dummy_dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only")
@@ -135,7 +132,6 @@ class TestNashMDTrainer(TrlTestCase):
             args=training_args,
             processing_class=self.tokenizer,
             train_dataset=dummy_dataset["train"],
-            eval_dataset=dummy_dataset["test"],
             peft_config=lora_config,
         )
 
@@ -152,7 +148,6 @@ class TestNashMDTrainer(TrlTestCase):
             per_device_train_batch_size=2,
             max_steps=3,
             learning_rate=5.0e-7,
-            eval_strategy="steps",
             report_to="none",
         )
         dummy_dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only")
@@ -164,7 +159,6 @@ class TestNashMDTrainer(TrlTestCase):
             args=training_args,
             processing_class=self.tokenizer,
             train_dataset=dummy_dataset["train"],
-            eval_dataset=dummy_dataset["test"],
             peft_config=lora_config,
         )
 
@@ -214,7 +208,6 @@ class TestNashMDTrainer(TrlTestCase):
             remove_unused_columns=False,
             gradient_accumulation_steps=1,
             learning_rate=9e-1,
-            eval_strategy="steps",
             report_to="none",
         )
         dummy_dataset = load_dataset("trl-internal-testing/zen", config_name)
@@ -227,7 +220,6 @@ class TestNashMDTrainer(TrlTestCase):
             args=training_args,
             processing_class=self.tokenizer,
             train_dataset=dummy_dataset["train"],
-            eval_dataset=dummy_dataset["test"],
         )
 
         trainer.train()

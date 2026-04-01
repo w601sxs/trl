@@ -1,4 +1,4 @@
-# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@ if is_peft_available():
 class TestXPOTrainer(TrlTestCase):
     def setup_method(self):
         self.model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_id)
+        self.model = AutoModelForCausalLM.from_pretrained(self.model_id, dtype="float32")
         self.ref_model = AutoModelForCausalLM.from_pretrained(self.model_id)
         self.reward_model = AutoModelForSequenceClassification.from_pretrained(self.model_id, num_labels=1)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
@@ -46,7 +46,6 @@ class TestXPOTrainer(TrlTestCase):
             remove_unused_columns=False,
             gradient_accumulation_steps=1,
             learning_rate=9e-1,
-            eval_strategy="steps",
             report_to="none",
         )
         dummy_dataset = load_dataset("trl-internal-testing/zen", config_name)
@@ -58,7 +57,6 @@ class TestXPOTrainer(TrlTestCase):
             args=training_args,
             processing_class=self.tokenizer,
             train_dataset=dummy_dataset["train"],
-            eval_dataset=dummy_dataset["test"],
         )
 
         trainer.train()
@@ -74,7 +72,6 @@ class TestXPOTrainer(TrlTestCase):
             per_device_train_batch_size=2,
             max_steps=3,
             learning_rate=5.0e-7,
-            eval_strategy="steps",
             report_to="none",
         )
         dummy_dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only")
@@ -85,7 +82,6 @@ class TestXPOTrainer(TrlTestCase):
             args=training_args,
             processing_class=self.tokenizer,
             train_dataset=dummy_dataset["train"],
-            eval_dataset=dummy_dataset["test"],
             peft_config=lora_config,
         )
 
@@ -102,7 +98,6 @@ class TestXPOTrainer(TrlTestCase):
             per_device_train_batch_size=2,
             max_steps=3,
             learning_rate=5.0e-7,
-            eval_strategy="steps",
             report_to="none",
         )
         dummy_dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only")
@@ -114,7 +109,6 @@ class TestXPOTrainer(TrlTestCase):
             args=training_args,
             processing_class=self.tokenizer,
             train_dataset=dummy_dataset["train"],
-            eval_dataset=dummy_dataset["test"],
             peft_config=lora_config,
         )
 
@@ -162,7 +156,6 @@ class TestXPOTrainer(TrlTestCase):
             remove_unused_columns=False,
             gradient_accumulation_steps=1,
             learning_rate=9e-1,
-            eval_strategy="steps",
             report_to="none",
         )
         dummy_dataset = load_dataset("trl-internal-testing/zen", config_name)
@@ -175,7 +168,6 @@ class TestXPOTrainer(TrlTestCase):
             args=training_args,
             processing_class=self.tokenizer,
             train_dataset=dummy_dataset["train"],
-            eval_dataset=dummy_dataset["test"],
         )
 
         trainer.train()

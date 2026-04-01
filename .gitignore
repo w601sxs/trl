@@ -144,5 +144,9 @@ nbs/wandb/
 examples/notebooks/wandb/
 wandb/
 
-# Kiro IDE files
-.kiro/
+# uv
+uv.lock
+
+# AI agent generated artifacts
+/.agents/skills
+/.claude/skills

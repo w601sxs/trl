@@ -1,4 +1,4 @@
-# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import dataclasses
+import asyncio
+import hashlib
 import importlib.resources as pkg_resources
-import json
 import os
 import random
 import socket
+import threading
 from collections.abc import Mapping, Sequence, Sized
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.metadata import version
 from itertools import accumulate
@@ -28,10 +30,8 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-import torch.utils.data
 import transformers
-from accelerate import Accelerator, PartialState, logging
-from accelerate.state import AcceleratorState
+from accelerate import PartialState, logging
 from huggingface_hub import ModelCard, ModelCardData
 from torch.utils.data import Sampler
 from transformers import (
@@ -40,13 +40,13 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
     is_comet_available,
+    is_trackio_available,
 )
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.models.auto.auto_factory import _BaseAutoModelClass
 from transformers.utils import (
     is_peft_available,
     is_rich_available,
-    is_torch_mlu_available,
-    is_torch_npu_available,
     is_torch_xpu_available,
 )
 
@@ -63,7 +63,7 @@ if is_comet_available():
     import comet_ml
 
 if is_peft_available():
-    from peft import LoraConfig, PeftConfig
+    from peft import LoraConfig, PeftConfig, PeftModel
 
 
 logger = logging.get_logger(__name__)
@@ -176,115 +176,10 @@ def pad(
     return output
 
 
-@dataclass
-class RunningMoments:
-    """
-    Calculates the running mean and standard deviation of a data stream. Reference:
-    https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/utils.py#L75
-    """
-
-    accelerator: Accelerator
-    mean: float = 0
-    std: float = 1
-    var: float = 1
-    count: float = 1e-24
-
-    @torch.no_grad()
-    def update(self, xs: torch.Tensor) -> tuple[float, float]:
-        """
-        Updates running moments from batch's moments computed across ranks
-        """
-        if self.accelerator.use_distributed:
-            xs_mean, xs_var, xs_count = get_global_statistics(self.accelerator, xs)
-        else:
-            xs_count = xs.numel()
-            xs_var, xs_mean = torch.var_mean(xs, unbiased=False)
-        xs_mean, xs_var = xs_mean.float(), xs_var.float()
-
-        delta = xs_mean - self.mean
-        tot_count = self.count + xs_count
-
-        new_sum = xs_var * xs_count
-        # correct old_sum deviation accounting for the new mean
-        old_sum = self.var * self.count + delta**2 * self.count * xs_count / tot_count
-        tot_sum = old_sum + new_sum
-
-        self.mean += (delta * xs_count / tot_count).item()
-        new_var = tot_sum / tot_count
-        self.std = (new_var * tot_count / (tot_count - 1)).float().sqrt().item()
-        self.var = new_var.item()
-        self.count = tot_count
-
-        return xs_mean.item(), (xs_var * xs_count / (xs_count - 1)).float().sqrt().item()
-
-    def save_to_json(self, json_path: str):
-        """Save the content of this instance in JSON format inside `json_path`."""
-        # save everything except accelerator
-        if self.accelerator.is_main_process:
-            save_dict = dataclasses.asdict(self, dict_factory=lambda x: {k: v for (k, v) in x if k != "accelerator"})
-            json_string = json.dumps(save_dict, indent=2, sort_keys=True) + "\n"
-            with open(json_path, "w", encoding="utf-8") as f:
-                f.write(json_string)
-
-    @classmethod
-    def load_from_json(cls, accelerator: Accelerator, json_path: str):
-        """Create an instance from the content of `json_path`."""
-        # load everything except accelerator
-        with open(json_path, encoding="utf-8") as f:
-            text = f.read()
-        return cls(accelerator=accelerator, **json.loads(text))
-
-
-@torch.no_grad()
-def get_global_statistics(
-    accelerator, xs: torch.Tensor, mask=None, device="cpu"
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """
-    Computes element-wise mean and variance of the tensor across processes. Reference:
-    https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/utils.py#L57C1-L73C75
-    """
-    xs = xs.to(accelerator.device)
-    sum_and_count = torch.tensor([xs.sum(), (xs.numel() if mask is None else mask.sum())], device=xs.device)
-    sum_and_count = accelerator.reduce(sum_and_count)
-    global_sum, count = sum_and_count
-    global_mean = global_sum / count
-
-    sum_var = torch.sum(((xs - global_mean) ** 2).mul(1 if mask is None else mask))
-    sum_var = accelerator.reduce(sum_var)
-    global_var = sum_var / count
-
-    return global_mean.to(device), global_var.to(device), count.item()
-
-
-def pad_to_length(tensor: torch.Tensor, length: int, pad_value: int | float, dim: int = -1) -> torch.Tensor:
-    if tensor.size(dim) >= length:
-        return tensor
-    else:
-        pad_size = list(tensor.shape)
-        pad_size[dim] = length - tensor.size(dim)
-        return torch.cat(
-            [
-                tensor,
-                pad_value * torch.ones(*pad_size, dtype=tensor.dtype, device=tensor.device),
-            ],
-            dim=dim,
-        )
-
-
 def disable_dropout_in_model(model: torch.nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, torch.nn.Dropout):
             module.p = 0
-
-
-def peft_module_casting_to_bf16(model):
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.LayerNorm) or "norm" in name:
-            module = module.to(torch.float32)
-        elif any(x in name for x in ["lm_head", "embed_tokens", "wte", "wpe"]):
-            if hasattr(module, "weight"):
-                if module.weight.dtype == torch.float32:
-                    module = module.to(torch.bfloat16)
 
 
 def get_quantization_config(model_args: ModelConfig) -> BitsAndBytesConfig | None:
@@ -339,105 +234,6 @@ def get_peft_config(model_args: ModelConfig) -> "PeftConfig | None":
     return peft_config
 
 
-def get_exp_cap(value, decimal=4):
-    """
-    Get the exponent cap of a value. This is used to cap the exponent of a value to avoid overflow. The formula is :
-    log(value.dtype.max) E.g. for float32 data type, the maximum exponent value is 88.7228 to 4 decimal points.
-
-    Args:
-        value (`torch.Tensor`):
-            The input tensor to obtain the data type
-        decimal (`int`):
-            The number of decimal points of the output exponent cap. eg: direct calling exp(log(torch.float32.max))
-            will result in inf so we cap the exponent to 88.7228 to avoid overflow.
-    """
-    vdtype_max = torch.zeros([1]).to(value.dtype) + torch.finfo(value.dtype).max
-    vdtype_log_max = torch.log(vdtype_max).to(value.device)
-    return torch.floor(vdtype_log_max * 10**decimal) / 10**decimal if decimal > 0 else vdtype_log_max
-
-
-def cap_exp(value, cap=-1):
-    # Cap the exponent value below the upper-bound to avoid overflow, before calling torch.exp
-    cap = get_exp_cap(value) if cap < 0 else cap
-    return torch.exp(torch.clamp(value, max=cap))
-
-
-def prepare_deepspeed(
-    model: torch.nn.Module, per_device_train_batch_size: int, fp16: bool = False, bf16: bool = False
-) -> torch.nn.Module:
-    """
-    Prepares the model for training with DeepSpeed (both for stage 2 and 3), configuring the appropriate settings based
-    on the model and batch size.
-
-    Args:
-        model (`torch.nn.Module`):
-            The model to be prepared for DeepSpeed training.
-        per_device_train_batch_size (`int`):
-            The training batch size per device.
-        fp16 (`bool`, defaults to `False`):
-            Whether to use FP16 precision.
-        bf16 (`bool`, defaults to `False`):
-            Whether to use BF16 precision.
-
-    Returns:
-        `torch.nn.Module`:
-            The model initialized and configured with DeepSpeed for training.
-    """
-    import deepspeed
-
-    deepspeed_plugin = AcceleratorState().deepspeed_plugin
-    config_kwargs = deepspeed_plugin.deepspeed_config
-    if config_kwargs["zero_optimization"]["stage"] != 3:
-        config_kwargs["train_micro_batch_size_per_gpu"] = per_device_train_batch_size
-        config_kwargs = {
-            "train_micro_batch_size_per_gpu": config_kwargs["train_micro_batch_size_per_gpu"],
-            "prescale_gradients": False,
-            "wall_clock_breakdown": False,
-        }
-        if bf16:
-            config_kwargs["bf16"] = {"enabled": True}
-        elif fp16:
-            config_kwargs["fp16"] = {"enabled": True}
-    else:
-        if hasattr(model, "config"):
-            hidden_size = (
-                max(model.config.hidden_sizes)
-                if getattr(model.config, "hidden_sizes", None)
-                else getattr(model.config, "hidden_size", None)
-            )
-            if hidden_size is not None and config_kwargs["zero_optimization"]["stage"] == 3:
-                # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache @ step 0: expected module 1, but got module 0`
-                # This is expected and is not an error, see: https://github.com/microsoft/DeepSpeed/discussions/4081
-                config_kwargs.update(
-                    {
-                        "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
-                        "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
-                        "zero_optimization.stage3_prefetch_bucket_size": 0,
-                    }
-                )
-    model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
-    model.eval()
-    return model
-
-
-def empty_cache() -> None:
-    """Empties the cache of the available torch device.
-
-    This function checks for the availability of different torch devices (XPU, MLU, NPU, CUDA) and empties the cache of
-    the first available device it finds.
-
-    If none of the specific devices are available, it defaults to emptying the CUDA cache.
-    """
-    if is_torch_xpu_available():
-        torch.xpu.empty_cache()
-    elif is_torch_mlu_available():
-        torch.mlu.empty_cache()
-    elif is_torch_npu_available():
-        torch.npu.empty_cache()
-    else:
-        torch.cuda.empty_cache()
-
-
 def generate_model_card(
     base_model: str | None,
     model_name: str,
@@ -445,6 +241,7 @@ def generate_model_card(
     dataset_name: str | None,
     tags: list[str],
     wandb_url: str | None,
+    trackio_url: str | None,
     trainer_name: str,
     trainer_citation: str | None = None,
     template_file: str | None = None,
@@ -468,6 +265,8 @@ def generate_model_card(
             Tags.
         wandb_url (`str` or `None`):
             Weights & Biases run URL.
+        trackio_url (`str` or `None`):
+            Trackio Space URL.
         comet_url (`str` or `None`):
             Comet experiment URL.
         trainer_name (`str`):
@@ -502,6 +301,7 @@ def generate_model_card(
         hub_model_id=hub_model_id,
         dataset_name=dataset_name,
         wandb_url=wandb_url,
+        trackio_url=trackio_url,
         comet_url=comet_url,
         trainer_name=trainer_name,
         trainer_citation=trainer_citation,
@@ -527,6 +327,27 @@ def get_comet_experiment_url() -> str | None:
         return comet_ml.get_running_experiment().url
 
     return None
+
+
+def get_trackio_space_url() -> str | None:
+    """
+    If Trackio integration is enabled, return the URL of the current Trackio Space; otherwise, return `None`.
+    """
+    if not is_trackio_available():
+        return None
+
+    from trackio import context_vars
+
+    run = context_vars.current_run.get()
+    if run is None:
+        return None
+    space_id = run._space_id
+    if space_id is None:
+        return None
+    space_id = space_id.replace("/", "-")
+    project = run.project
+    name = run.name
+    return f"https://{space_id}.hf.space?project={project}&runs={name}&sidebar=collapsed"
 
 
 def log_table_to_comet_experiment(name: str, table: pd.DataFrame) -> None:
@@ -612,68 +433,50 @@ def flush_left(mask: torch.Tensor, *tensors: torch.Tensor) -> torch.Tensor | tup
     return flushed_mask, *flushed_tensors
 
 
-def flush_right(mask: torch.Tensor, *tensors: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    """
-    Shift non-zero elements in the mask and corresponding tensors to the right. See `flush_left` for details.
-    """
-    _, M = mask.shape
-
-    # Create copy of mask and tensors
-    mask_copy = mask.clone()
-    tensors = [t.clone() for t in tensors]
-
-    # Shift non-zero values to the right
-    flipped_mask = torch.fliplr(mask_copy)
-    first_non_zero = flipped_mask.argmax(dim=1)
-    pos = torch.arange(M, device=mask_copy.device).unsqueeze(0)
-    idx_roll = (pos - first_non_zero.unsqueeze(1)) % M
-    mask_roll = mask_copy.gather(1, idx_roll)
-    rolled_tensors = [t.gather(1, idx_roll) for t in tensors]
-
-    # Truncate leading columns that are all zeros in mask_roll
-    col_sums = mask_roll.sum(dim=0)
-    non_empty_cols = col_sums != 0
-    first_non_empty_col = int(non_empty_cols.to(torch.int8).argmax()) if non_empty_cols.any() else M
-    flushed_mask = mask_roll[:, first_non_empty_col:]
-    flushed_tensors = [t[:, first_non_empty_col:] for t in rolled_tensors]
-
-    if not flushed_tensors:
-        return flushed_mask
-    return flushed_mask, *flushed_tensors
-
-
 def selective_log_softmax(logits, index) -> torch.Tensor:
     """
     A memory-efficient implementation of the common `log_softmax -> gather` operation.
 
     This function is equivalent to the following naive implementation:
     ```python
+    # for index with shape (...):
     logps = torch.gather(logits.log_softmax(-1), dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+    # for index with shape (..., K):
+    logps = torch.gather(logits.log_softmax(-1), dim=-1, index=index)
     ```
 
     Args:
         logits (`torch.Tensor`):
             Logits tensor of shape `(..., num_classes)`.
         index (`torch.Tensor`):
-            Index tensor of shape `(...)`, specifying the positions to gather from the log-softmax output.
+            Index tensor of shape `(..., K)` or `(...)`, specifying the positions to gather from the log-softmax
+            output. When the last case is used, `K` log-probabilities are gathered per position (e.g. for top-K)
 
     Returns:
         `torch.Tensor`:
             Gathered log probabilities with the same shape as `index`.
     """
+    squeeze = index.ndim == logits.ndim - 1
+    if squeeze:
+        index = index.unsqueeze(-1)
+
     if logits.dtype in [torch.float32, torch.float64]:
-        selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+        selected_logits = torch.gather(logits, dim=-1, index=index)
         # loop to reduce peak mem consumption
         logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
-        per_token_logps = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+        per_token_logps = selected_logits - logsumexp_values.unsqueeze(-1)  # log_softmax(x_i) = x_i - logsumexp(x)
     else:
         # logsumexp approach is unstable with bfloat16, fall back to slightly less efficient approach
         per_token_logps = []
         for row_logits, row_labels in zip(logits, index, strict=True):  # loop to reduce peak mem consumption
             row_logps = F.log_softmax(row_logits, dim=-1)
-            row_per_token_logps = row_logps.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
+            row_per_token_logps = row_logps.gather(dim=-1, index=row_labels)
             per_token_logps.append(row_per_token_logps)
         per_token_logps = torch.stack(per_token_logps)
+
+    if squeeze:
+        per_token_logps = per_token_logps.squeeze(-1)
+
     return per_token_logps
 
 
@@ -782,10 +585,15 @@ def print_prompt_completions_sample(
         if isinstance(entry, list) and all(isinstance(m, dict) for m in entry):
             for j, msg in enumerate(entry):
                 role = msg.get("role", "")
-                if "content" in msg:
+                if "content" in msg or "reasoning_content" in msg or "thinking" in msg:
                     # Chat message
                     t.append(f"{role.upper()}\n", style="bold red")
-                    t.append(msg["content"])
+                    reasoning = msg.get("reasoning_content") or msg.get("thinking")
+                    if reasoning:
+                        t.append(reasoning, style="italic dim white")
+                        t.append("\n")
+                    if "content" in msg:
+                        t.append(msg["content"])
                 elif "name" in msg and "args" in msg:
                     # Tool call
                     t.append(f"{role.upper()}\n", style="bold red")
@@ -925,22 +733,40 @@ class RepeatSampler(Sampler):
 
 
 # torch.nanstd doesn't exist, so we define it here
-def nanstd(tensor: torch.Tensor) -> torch.Tensor:
+def nanstd(tensor: torch.Tensor, dim: int | tuple[int, ...] | None = None, keepdim: bool = False) -> torch.Tensor:
     """
-    Compute the standard deviation of a tensor, ignoring NaNs. This function only supports 1D tensors.
+    Compute the standard deviation of a tensor, ignoring NaNs.
 
     Args:
         tensor (`torch.Tensor`):
-            Input tensor of shape `(N,)`.
+            Input tensor.
+        dim (`int` or `tuple[int, ...]`, *optional*):
+            Dimension(s) to reduce. Defaults to all dimensions.
+        keepdim (`bool`, *optional*, defaults to `False`):
+            Whether to keep reduced dimensions.
 
     Returns:
         `torch.Tensor`:
             Standard deviation of the tensor, ignoring NaNs.
     """
-    variance = torch.nanmean((tensor - torch.nanmean(tensor, keepdim=True)) ** 2)  # Compute variance ignoring NaNs
-    count = torch.sum(~torch.isnan(tensor))  # Count of non-NaN values
-    variance *= count / (count - 1)  # Bessel's correction
-    return torch.sqrt(variance)
+    # Compute variance ignoring NaNs
+    mean = torch.nanmean(tensor, dim=dim, keepdim=True)
+    variance = torch.nanmean((tensor - mean) ** 2, dim=dim, keepdim=True)
+    count = torch.sum(~torch.isnan(tensor), dim=dim, keepdim=True)  # count of non-NaN values
+    correction = count / (count - 1)
+    correction = torch.where(count > 1, correction, torch.full_like(correction, float("nan")))
+    variance *= correction  # Bessel's correction
+    std = torch.sqrt(variance)
+    if keepdim:
+        return std
+    if dim is None:
+        return std.squeeze()
+    if isinstance(dim, int):
+        return std.squeeze(dim)
+    dims = [(d if d >= 0 else d + std.ndim) for d in dim]
+    for d in sorted(dims, reverse=True):
+        std = std.squeeze(d)
+    return std
 
 
 def split_tensor_dict(
@@ -1087,6 +913,12 @@ def unsplit_pixel_values_by_grid(batch: dict[str, torch.Tensor | list[torch.Tens
 TListOrMapping = TypeVar("TListOrMapping", list, Mapping)
 
 
+# This function is intentionally not used internally. It is provided as a utility for users whose datasets contain
+# `None` values inserted by tabular backends (e.g., Arrow/Parquet) for missing keys in nested structures. This
+# situation arises when loading datasets created before `datasets` v4.7.0 (which introduced the Json dtype), or when
+# datasets created after that version were saved without using the Json feature. In both cases, users can apply this
+# function via `dataset = dataset.with_transform(remove_none_values)` before training to strip the spurious `None`
+# values. See the migration guide for more details.
 def remove_none_values(example: TListOrMapping) -> TListOrMapping:
     """
     Recursively removes entries with `None` values from a nested structure (list or dictionary).
@@ -1095,7 +927,10 @@ def remove_none_values(example: TListOrMapping) -> TListOrMapping:
         example (`list` or `Mapping`):
             Input nested structure (list or dictionary) from which to remove `None`.
 
-    Example:
+    Examples:
+    ```python
+    >>> dataset = dataset.with_transform(remove_none_values)
+    ```
     ```python
     >>> [
     ...     {
@@ -1134,13 +969,13 @@ def create_model_from_path(
         kwargs (`dict`):
             Initialization keyword arguments to pass to the model's `from_pretrained` method. When `'dtype'` is
             specified, it can be either a `torch.dtype` or one of the strings: `'bfloat16'`, `'float16'`, `'float32'`,
-            or `'auto'`.
+            or `'auto'`. If not explicitly set, `dtype` defaults to `'float32'`.
 
     Returns:
         [`~transformers.PreTrainedModel`]:
             The instantiated model.
     """
-    dtype = kwargs.get("dtype", "auto")
+    dtype = kwargs.get("dtype", "float32")
     if isinstance(dtype, torch.dtype) or dtype == "auto" or dtype is None:
         pass  # dtype is already a torch.dtype or "auto" or None
     elif isinstance(dtype, str) and dtype in ["bfloat16", "float16", "float32"]:
@@ -1158,6 +993,17 @@ def create_model_from_path(
     return model
 
 
+def hash_module(module: torch.nn.Module) -> str:
+    h = hashlib.sha256()
+    for _, tensor in sorted(module.state_dict().items()):
+        tensor = tensor.cpu()
+        h.update(str(tensor.dtype).encode())
+        if tensor.dtype in [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]:
+            tensor = tensor.to(torch.float32)
+        h.update(tensor.numpy().tobytes())
+    return h.hexdigest()
+
+
 def get_config_model_id(config: PretrainedConfig) -> str:
     """
     Retrieve the model identifier from a given model configuration.
@@ -1171,3 +1017,155 @@ def get_config_model_id(config: PretrainedConfig) -> str:
             The model identifier associated with the model configuration.
     """
     return getattr(config, "_name_or_path", "")
+
+
+@dataclass
+class CausalLMOutputWithPastAndFlatLogits(CausalLMOutputWithPast):
+    flat_logits: torch.Tensor | None = None
+
+
+def forward_masked_logits(
+    model: PreTrainedModel, logits_mask: torch.LongTensor, **kwargs
+) -> CausalLMOutputWithPastAndFlatLogits:
+    """
+    Run a Causal LM forward pass while computing logits only for masked positions to reduce memory usage.
+
+    These are always equal:
+
+    ```python
+    full_outputs = model(input_ids=input_ids)
+    masked_outputs = forward_masked_logits(model, mask, input_ids=input_ids)
+
+    assert torch.equal(
+        masked_outputs.flat_logits,
+        full_outputs.logits[mask.bool()],
+    )
+    ```
+
+    Args:
+        model ([`~transformers.PreTrainedModel`]):
+            A causal language model.
+        logits_mask (`torch.LongTensor`):
+            Boolean-like tensor indicating which token positions should have logits computed. Shape should match the
+            input sequence shape in `kwargs` (typically `[batch, seq_len]`).
+        **kwargs:
+            Keyword arguments forwarded to the inner decoder (e.g., `input_ids`, `attention_mask`, `past_key_values`).
+
+    Returns:
+        `CausalLMOutputWithPastAndFlatLogits`: Output containing logits only for the unmasked positions.
+
+    Raises:
+        ValueError: If `logits_to_keep` or `labels` are provided in `kwargs`.
+    """
+    if kwargs.get("logits_to_keep") is not None:
+        raise ValueError("`logits_to_keep` is not supported by this forward helper.")
+    if kwargs.get("labels") is not None:
+        raise ValueError("`labels` is not yet supported by this forward helper.")
+
+    outputs: BaseModelOutputWithPast = model.get_decoder()(**kwargs)
+    hidden_states = outputs.last_hidden_state
+
+    # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+    flat_logits = model.lm_head(hidden_states[logits_mask.bool()])
+    if hasattr(model, "logit_scale"):  # CohereForCausalLM has this attribute
+        flat_logits = flat_logits * model.logit_scale
+
+    return CausalLMOutputWithPastAndFlatLogits(
+        flat_logits=flat_logits,
+        # We use .get(...) because some models like FalconMambaForCausalLM don't return past_key_values or attentions
+        past_key_values=outputs.get("past_key_values"),
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.get("attentions"),
+    )
+
+
+@contextmanager
+def use_adapter(model: "PeftModel", adapter_name: str | None):
+    """
+    Context manager to temporarily set and reset the active adapter in a PEFT model.
+
+    Args:
+        model ([`~peft.PeftModel`]):
+            PEFT model to manage.
+        adapter_name (`str` or `None`):
+            Name of the adapter to set as active. If `None`, the context manager will disable all adapters.
+
+    Example:
+    ```python
+    >>> from trl.trainer.utils import use_adapter
+    >>> from peft import AutoPeftModelForCausalLM
+    >>> import torch
+
+    >>> model = AutoPeftModelForCausalLM.from_pretrained("path/to/model")
+    >>> input_ids = torch.tensor([[1, 2, 3]])
+    >>> with use_adapter(model, "adapter_name"):
+    ...     outputs = model(input_ids)
+    ```
+    """
+
+    if not is_peft_available():
+        raise ImportError(
+            "You're trying to use a PEFT adapter but PEFT is not installed. Please install it with `pip install peft`."
+        )
+    if adapter_name is None:
+        with model.disable_adapter():
+            yield
+    else:
+        previous_adapter = model.active_adapter
+        model.set_adapter(adapter_name)
+        try:
+            yield
+        finally:
+            model.set_adapter(previous_adapter)
+
+
+def start_event_loop_in_daemon(
+    name: str | None = None,
+) -> tuple[threading.Thread, asyncio.AbstractEventLoop, threading.Event]:
+    """
+    This function creates a new daemon thread that runs the provided event loop.
+
+    Args:
+        name (`str`, *optional*):
+            Name of the thread. If `None`, the default thread naming will be used.
+
+    Returns:
+        `threading.Thread`:
+            The thread running the event loop.
+        `asyncio.AbstractEventLoop`:
+            The event loop being run in the thread.
+        `threading.Event`:
+            An event that is set when the loop is ready.
+    """
+    loop = asyncio.new_event_loop()
+    loop_ready_event = threading.Event()
+
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop_ready_event.set()
+        loop.run_forever()
+
+    thread = threading.Thread(target=run_loop, name=name, daemon=True)
+    thread.start()
+    return thread, loop, loop_ready_event
+
+
+def shutdown_event_loop_in_daemon(
+    thread: threading.Thread | None,
+    loop: asyncio.AbstractEventLoop | None,
+) -> None:
+    """
+    Shutdown an asyncio event loop running in a separate thread.
+
+    This function stops the event loop and waits for the associated thread to finish execution.
+
+    Args:
+        thread (`threading.Thread`):
+            The thread running the event loop.
+        loop (`asyncio.AbstractEventLoop`):
+            The asyncio event loop to shut down.
+    """
+    if loop is None or thread is None:
+        return
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
