@@ -167,6 +167,11 @@ class HICRATrainer(GRPOTrainer):
         # Cache for tokenized Strategic Grams as tensors (optimization)
         self._sg_tensor_cache = {}
 
+        # Cache used by _compute_loss to pass forward-pass results to
+        # _get_per_token_logps_and_entropies, avoiding a second model forward pass.
+        self._hicra_cached_logps = None
+        self._hicra_cached_entropies = None
+
         logger.info(f"Loaded {len(self.strategic_grams)} Strategic Grams for HICRA training")
 
     def _load_strategic_grams(self) -> list[str]:
@@ -483,7 +488,7 @@ class HICRATrainer(GRPOTrainer):
 
     def _get_per_token_logps_and_entropies(self, model, input_ids, attention_mask, logits_to_keep, **kwargs):
         """Return cached logps/entropies when available to avoid a second forward pass."""
-        if getattr(self, "_hicra_cached_logps", None) is not None:
+        if self._hicra_cached_logps is not None:
             return self._hicra_cached_logps, self._hicra_cached_entropies
         return super()._get_per_token_logps_and_entropies(
             model, input_ids, attention_mask, logits_to_keep, **kwargs
