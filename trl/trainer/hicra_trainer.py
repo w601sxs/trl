@@ -458,8 +458,13 @@ class HICRATrainer(GRPOTrainer):
 
             # VeRL: if planning_token_mask is None
             if planning_token_mask is None:
+                # Build a full [total_batch, seq_len] mask so we can use a single-level index
+                # operation. Chained indexing (advantages[is_current_group][is_high_entropy])
+                # creates an intermediate copy and the in-place *= is silently discarded.
                 # VeRL: advantages[is_current_group][is_higher_entropy] *= 1 + target_scaler
-                advantages[is_current_group][is_high_entropy] *= 1 + alpha
+                full_mask = torch.zeros_like(advantages, dtype=torch.bool)
+                full_mask[is_current_group] = is_high_entropy
+                advantages[full_mask] *= 1 + alpha
             else:
                 # VeRL: is_planning_token = planning_token_mask[is_current_group]>0
                 is_planning = planning_token_mask[is_current_group] > 0  # [group_size, seq_len]
@@ -467,27 +472,33 @@ class HICRATrainer(GRPOTrainer):
                 # VeRL: prev_values = advantages[is_current_group][is_higher_entropy|is_planning_token]
                 # VeRL: signs = torch.sign(prev_values)
                 amplify_mask = is_high_entropy | is_planning  # [group_size, seq_len]
-                prev_values = advantages[is_current_group][amplify_mask]
-                signs = torch.sign(prev_values)
+                full_amplify_mask = torch.zeros_like(advantages, dtype=torch.bool)
+                full_amplify_mask[is_current_group] = amplify_mask
+                signs = torch.sign(advantages[full_amplify_mask])
 
                 # VeRL: advantages[is_current_group][is_higher_entropy|is_planning_token] *= 1 + target_scaler*signs
-                advantages[is_current_group][amplify_mask] *= 1 + alpha * signs
+                advantages[full_amplify_mask] *= 1 + alpha * signs
 
         return advantages
+
+    def _get_per_token_logps_and_entropies(self, model, input_ids, attention_mask, logits_to_keep, **kwargs):
+        """Return cached logps/entropies when available to avoid a second forward pass."""
+        if getattr(self, "_hicra_cached_logps", None) is not None:
+            return self._hicra_cached_logps, self._hicra_cached_entropies
+        return super()._get_per_token_logps_and_entropies(
+            model, input_ids, attention_mask, logits_to_keep, **kwargs
+        )
 
     def _compute_loss(self, model, inputs):
         """
         Compute loss with HICRA-modified advantages.
 
-        This method overrides the parent GRPO _compute_loss to integrate HICRA advantage
-        modification. It extracts the necessary data (completion_ids, entropies, response_mask,
-        group_ids), applies HICRA modification to advantages, and then calls the parent loss
-        computation.
-
-        Memory optimizations:
-        - Early return to parent method if HICRA is disabled
-        - Lazy computation of planning tokens only when needed
-        - Efficient tensor operations to minimize memory footprint
+        Runs one forward pass to obtain per-token entropies, uses them to amplify
+        advantages for high-entropy / planning tokens (HICRA modification), then
+        delegates the full loss computation and metric logging to the parent
+        GRPOTrainer._compute_loss.  The forward-pass result is cached on ``self``
+        so that the parent's call to ``_get_per_token_logps_and_entropies`` returns
+        immediately without a second pass through the model.
 
         Args:
             model: The model being trained.
@@ -496,27 +507,19 @@ class HICRATrainer(GRPOTrainer):
         Returns:
             Loss tensor.
         """
-        # Early return if HICRA is disabled - use parent GRPO implementation directly
         if not self.args.use_hicra:
             return super()._compute_loss(model, inputs)
 
-        # First, we need to compute entropies which are needed for HICRA
-        # We'll call the parent method but intercept before the loss computation
-        # to modify advantages
-
-        # Extract data needed for HICRA
-        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)
+        input_ids = torch.cat([inputs["prompt_ids"], completion_ids], dim=1)
+        attention_mask = torch.cat([inputs["prompt_mask"], completion_mask], dim=1)
 
-        # Compute the per_token_logps and the entropy at each position in the completion
+        # Forward pass — results are cached so super()._compute_loss() reuses them.
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
             attention_mask,
-            logits_to_keep,
+            completion_ids.size(1),
             compute_entropy=True,
             pixel_values=inputs.get("pixel_values"),
             image_grid_thw=inputs.get("image_grid_thw"),
@@ -526,35 +529,21 @@ class HICRATrainer(GRPOTrainer):
             token_type_ids=inputs.get("token_type_ids"),
         )
 
-        # Store entropies in inputs for later use
-        inputs["entropies"] = entropies
-
-        # Get advantages from inputs
+        # Expand advantages to [batch_size, seq_len] for token-level HICRA modification.
         advantages = inputs["advantages"]
-
-        # Expand advantages to per-token shape [batch_size, seq_len] for HICRA modification
-        # In base GRPO, advantages are [batch_size] and get unsqueezed to [batch_size, 1]
-        # For HICRA, we need [batch_size, seq_len] to apply token-level modifications
         if advantages.dim() == 1:
-            # Expand to [batch_size, seq_len] by broadcasting
-            advantages = advantages.unsqueeze(1).expand(-1, completion_ids.size(1))
+            advantages = advantages.unsqueeze(1).expand(-1, completion_ids.size(1)).clone()
         elif advantages.dim() == 2 and advantages.size(1) == 1:
-            # Already [batch_size, 1], expand to [batch_size, seq_len]
-            advantages = advantages.expand(-1, completion_ids.size(1))
+            advantages = advantages.expand(-1, completion_ids.size(1)).clone()
 
-        # Derive group_ids from batch structure
-        # In GRPO, samples are grouped by num_generations
-        # Each group of num_generations consecutive samples shares the same prompt
         batch_size = completion_ids.size(0)
         num_generations = self.num_generations if self.model.training else self.num_generations_eval
         group_ids = np.repeat(np.arange(batch_size // num_generations), num_generations)
 
-        # Identify planning tokens if using Strategic Grams
         planning_token_mask = None
         if self.args.use_planning_tokens and self.sg_token_ids:
             planning_token_mask = self.identify_planning_tokens(completion_ids)
 
-        # Apply HICRA advantage modification
         advantages = self.modify_advantages_hicra(
             advantages=advantages,
             completion_ids=completion_ids,
@@ -563,152 +552,25 @@ class HICRATrainer(GRPOTrainer):
             group_ids=group_ids,
             planning_token_mask=planning_token_mask,
         )
-
-        # Store modified advantages back in inputs
         inputs["advantages"] = advantages
 
-        # Now call the parent _compute_loss with modified advantages
-        # We need to bypass the entropy computation since we already did it
-        # So we'll inline the rest of the parent's _compute_loss logic
+        # Cache forward-pass results; _get_per_token_logps_and_entropies returns them
+        # immediately when super()._compute_loss() calls it, avoiding a second pass.
+        self._hicra_cached_logps = per_token_logps
+        self._hicra_cached_entropies = entropies
+        try:
+            loss = super()._compute_loss(model, inputs)
+        finally:
+            self._hicra_cached_logps = None
+            self._hicra_cached_entropies = None
 
-        if self.top_entropy_quantile < 1.0:
-            mask = completion_mask if not self.tools else completion_mask * inputs["tool_mask"]
-            entropy_mask = self.get_high_entropy_mask(entropies, mask, 1 - self.top_entropy_quantile)
-        else:
-            entropy_mask = None
-
-        # Note: advantages are already [batch_size, seq_len] from HICRA modification
-        # No need to unsqueeze
-
-        old_per_token_logps = inputs.get("old_per_token_logps")
-        old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
-
-        log_ratio = per_token_logps - old_per_token_logps
-        if self.importance_sampling_level == "token":
-            log_importance_weights = log_ratio
-        elif self.importance_sampling_level == "sequence":
-            mask = completion_mask if not self.tools else completion_mask * inputs["tool_mask"]
-            log_importance_weights = (log_ratio * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
-            log_importance_weights = log_importance_weights.unsqueeze(-1)
-        else:
-            raise ValueError(
-                f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
-                "and 'sequence'."
-            )
-
-        coef_1 = torch.exp(log_importance_weights)
-
-        # Compute the KL divergence between the model and the reference model
-        if self.beta != 0.0:
-            ref_per_token_logps = inputs["ref_per_token_logps"]
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            )
-            # Importance sampling correction for the KL divergence
-            if self.args.use_bias_correction_kl:
-                per_token_kl = per_token_kl * coef_1
-
-        # Compute per-token loss based on loss type
-        if self.loss_type == "cispo":
-            clamped_ratios = torch.clamp(coef_1, max=self.epsilon_high).detach()
-            per_token_loss = -clamped_ratios * advantages * per_token_logps
-        elif self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"]:
-            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-            # Two-sided clipping
-            if self.args.delta is not None:
-                coef_1 = torch.clamp(coef_1, max=self.args.delta)
-
-            per_token_loss1 = coef_1 * advantages
-            per_token_loss2 = coef_2 * advantages
-            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
-        elif self.loss_type == "sapo":
-            per_token_loss = torch.empty_like(coef_1)
-            positive_advantages_mask = advantages > 0
-            per_token_loss[positive_advantages_mask] = self.get_sapo_token_loss(
-                coef_1[positive_advantages_mask], self.args.sapo_temperature_pos
-            )
-            per_token_loss[~positive_advantages_mask] = self.get_sapo_token_loss(
-                coef_1[~positive_advantages_mask], self.args.sapo_temperature_neg
-            )
-            per_token_loss = -per_token_loss * advantages
-        else:
-            raise ValueError(f"Unknown loss type: {self.loss_type}")
-
-        if entropy_mask is not None:
-            per_token_loss = per_token_loss * entropy_mask
-
-        if self.use_vllm and self.vllm_importance_sampling_correction:
-            per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
-
-        if self.beta != 0.0:
-            per_token_loss = per_token_loss + self.beta * per_token_kl
-
-        mask = completion_mask if not self.tools else completion_mask * inputs["tool_mask"]
-        if self.loss_type in ["grpo", "sapo"]:
-            loss = ((per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "bnpo":
-            loss = (per_token_loss * mask).sum() / mask.sum().clamp(min=1.0)
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "dr_grpo":
-            loss = (per_token_loss * mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type in ["cispo", "dapo"]:
-            normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
-            loss = (per_token_loss * mask).sum() / normalizer
-        else:
-            raise ValueError(f"Unknown loss type: {self.loss_type}")
-
-        # Log the metrics (same as parent)
-        mode = "train" if self.model.training else "eval"
-
-        completion_token_count = mask.sum().clamp(min=1.0)
-
-        def masked_batch_mean(x):
-            if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
-                return x.mean()
-            else:
-                return (x * mask).sum() / completion_token_count
-
-        if self.beta != 0.0:
-            mean_kl = masked_batch_mean(per_token_kl)
-            self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
-
-        mean_entropy = masked_batch_mean(entropies)
-        self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
-
-        # Log HICRA-specific metrics
-        if self.args.use_hicra and planning_token_mask is not None:
+        if planning_token_mask is not None:
             self.log_hicra_metrics(
                 completion_ids=completion_ids,
                 advantages=advantages,
                 planning_mask=planning_token_mask,
                 response_mask=completion_mask,
             )
-
-        if self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"]:
-            # Compute the clipped probability ratios
-            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
-            is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
-            is_region_clipped = is_low_clipped | is_high_clipped
-
-            low_clip = masked_batch_mean(is_low_clipped.float())
-            high_clip = masked_batch_mean(is_high_clipped.float())
-            clip_ratio = masked_batch_mean(is_region_clipped.float())
-
-            gathered_low_clip = self.accelerator.gather(low_clip)
-            self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
-            self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-            gathered_high_clip = self.accelerator.gather(high_clip)
-            self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
-            self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
-            gathered_clip_ratio = self.accelerator.gather(clip_ratio)
-            self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
-        elif self.loss_type == "cispo":
-            is_cispo_clipped = (coef_1 > self.epsilon_high) & (advantages > 0)
-            cispo_clip_ratio = masked_batch_mean(is_cispo_clipped.float())
-            gathered_cispo_clip_ratio = self.accelerator.gather(cispo_clip_ratio)
-            self._metrics[mode]["cispo_clip_ratio"].append(gathered_cispo_clip_ratio.nanmean().item())
 
         return loss
 
