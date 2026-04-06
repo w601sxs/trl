@@ -606,6 +606,11 @@ class HICRATrainer(GRPOTrainer):
         if not self.args.log_planning_token_ratio and not self.args.log_semantic_entropy:
             return
 
+        # Ensure response_mask is bool so that & with planning_mask (bool) stays bool.
+        # If response_mask is int/long, PyTorch promotes the result to int and
+        # tensor[int_mask] performs integer advanced indexing instead of boolean masking.
+        response_mask = response_mask.bool()
+
         # Planning token ratio: percentage of tokens that are planning tokens
         if self.args.log_planning_token_ratio:
             # Count planning tokens among valid response tokens
