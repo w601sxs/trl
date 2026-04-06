@@ -150,7 +150,7 @@ def extract_strategic_grams(
     return list(set(strategic_grams))
 
 
-def get_default_strategic_grams(domain: str = "math") -> list[str]:
+def get_default_strategic_grams(domain: str = "original") -> list[str]:
     """
     Get pre-computed Strategic Grams for common reasoning domains.
 
@@ -159,7 +159,9 @@ def get_default_strategic_grams(domain: str = "math") -> list[str]:
     high-level strategic reasoning patterns.
 
     Args:
-        domain: The reasoning domain. Supported: "math", "code". Default: "math".
+        domain: The reasoning domain. Supported: ``"original"``, ``"math"``, ``"code"``.
+            ``"original"`` returns the exact seed collection from the HICRA paper's
+            reference implementation (TIGER-AI-Lab/Hierarchical-Reasoner). Default: ``"original"``.
 
     Returns:
         List of Strategic Gram strings for the specified domain.
@@ -168,11 +170,72 @@ def get_default_strategic_grams(domain: str = "math") -> list[str]:
         ValueError: If the domain is not supported.
 
     Example:
-        >>> math_sgs = get_default_strategic_grams("math")
-        >>> print(math_sgs[:3])
-        ["let's try a different approach", "we can use the fact that", "notice that"]
+        >>> sgs = get_default_strategic_grams("original")
+        >>> print(sgs[:3])
+        ['## step', 'a good starting point is', 'a more direct approach is']
     """
     DEFAULT_SG_SETS = {
+        # Verbatim seed_collection from TIGER-AI-Lab/Hierarchical-Reasoner
+        # verl/utils/reasoning_hierarchy.py (deduplicated, sorted)
+        "original": sorted({
+            '## step', 'a good starting point is', 'a more direct approach is',
+            'a more straightforward approach', 'a simpler approach is', 'alright',
+            'alternatively', 'an error in the thought process', 'analyze the',
+            'analyzing the given', 'and then find', 'another approach',
+            'are looking for', 'based on the given', 'break down the problem',
+            'break it down', 'break it down into manageable steps', 'but',
+            'but wait', 'but why', 'but without more information',
+            'can be rewritten as', 'can conclude that', 'can see that', 'check if',
+            'consider the properties of', 'correct the approach', 'define the variables',
+            'denote', 'determine how many', 'directly address the problem',
+            'finally need to', 'finally we need to', 'find a simpler', 'find a way to',
+            'find out how many', 'find the critical points', 'first need to',
+            'follow these steps', 'for simplicity', 'from earlier we have',
+            'from the above', 'given the complexity', 'given the complexity of',
+            'given the constraints', 'given the nature of', 'go back to the',
+            'goal is to', 'hmm,', 'however', 'however, we need to', 'identify the',
+            'identify the given information', 'if we consider', 'in a way that',
+            'in the context of', 'it seems', "it's better", 'let me', 'let me verify',
+            "let's", "let's denote", "let's double-check", 'looking back at the',
+            'maybe', 'maybe i can', 'need to', 'need to account for',
+            'need to analyze', 'need to check', 'need to consider', 'need to count',
+            'need to determine', 'need to ensure', 'need to express', 'need to find',
+            'need to follow', 'need to identify', 'need to minimize',
+            'need to reconsider', 'need to show', 'need to solve',
+            'need to think about', 'need to understand', 'need to use', 'next',
+            'note that', 'now', 'now let', 'now need to', 'now we need to',
+            'okay', 'one way to', 'perhaps', 'perhaps i can', 'problem is asking',
+            'problem states that', 'proceed with the following',
+            'rearrange the equation', 'recall that', 'referring to a previous step',
+            'rewrite the equation', 'says that', 'seems a bit complicated',
+            'should consider', 'should focus on', 'should look for', 'similarly',
+            'simplify the problem', 'since', 'so', 'so after', 'so again',
+            'so, yes', 'specifically', 'start by', 'states that', 'step by step',
+            'step by step reasoning', 'step by step solution',
+            'step-by-step reasoning', 'that seems', 'the correct approach is',
+            'the first step is', 'the key insight is', 'the key to solving this',
+            'the logical flow is', 'the next step is', 'the path to the solution',
+            'the problem asks for', 'the problem is about', 'the problem mentions',
+            'the problem says', 'the problem states', 'the problem states that',
+            'there is a mistake', 'there seems to be', 'therefore',
+            'think of this as', 'this allows us to', 'this approach seems',
+            'this can be seen as', 'this implies', 'this is because',
+            'this is not the correct approach', 'this leads to', 'this means',
+            'this means that', 'this seems a bit', 'this suggests',
+            'this suggests that', 'thus', 'to confirm',
+            'to consider the constraints', 'to determine', 'to do this',
+            'to ensure', 'to ensure correctness', 'to find', 'to make it easier',
+            'to proceed', 'to see if', 'to solve this problem', 'to verify',
+            'try to', 'understand the given information', 'understanding the problem',
+            'understanding the problem first', 'upon closer inspection',
+            'use the concept of', 'use the fact', 'use the fact that',
+            'use the method of', 'use the properties of', 'verify the solution',
+            'wait', 'wait, but', 'wait, no', 'want to find', 'we are dealing with',
+            'we can', 'we can approach this', 'we can conclude', 'we can deduce',
+            'we can infer', 'we can see', 'we can start by',
+            'we can think of this as', 'we can use', 'we know',
+            'what is being asked', 'will consider the', 'work our way',
+        }),
         "math": [
             "let's try a different approach",
             "we can use the fact that",

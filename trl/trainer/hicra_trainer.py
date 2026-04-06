@@ -191,13 +191,12 @@ class HICRATrainer(GRPOTrainer):
             except Exception as e:
                 logger.warning(
                     f"Failed to load Strategic Grams from {self.args.strategic_grams_path}: {e}. "
-                    "Falling back to default math Strategic Grams."
+                    f"Falling back to '{self.args.strategic_grams_preset}' preset."
                 )
-                return get_default_strategic_grams("math")
+                return get_default_strategic_grams(self.args.strategic_grams_preset)
         else:
-            # Load default SG set for math reasoning
-            logger.info("Using default Strategic Grams for math reasoning")
-            return get_default_strategic_grams("math")
+            logger.info(f"Using '{self.args.strategic_grams_preset}' Strategic Grams preset")
+            return get_default_strategic_grams(self.args.strategic_grams_preset)
 
     def _convert_sgs_to_token_ids(self) -> dict[int, list[list[int]]]:
         """

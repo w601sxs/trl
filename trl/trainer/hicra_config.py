@@ -48,6 +48,10 @@ class HICRAConfig(GRPOConfig):
 
         > Strategic Gram configuration
 
+        strategic_grams_preset (`str`, *optional*, defaults to `"original"`):
+            Named preset of Strategic Grams to use. Supported values: ``"original"`` (the exact seed
+            collection from the HICRA paper's reference implementation), ``"math"``, ``"code"``. Ignored
+            when `strategic_grams` or `strategic_grams_path` is provided.
         strategic_grams_path (`str`, *optional*):
             Path to a JSON file containing pre-computed Strategic Grams. If provided, these Strategic Grams
             will be loaded and used for planning token identification. Mutually exclusive with `strategic_grams`.
@@ -96,6 +100,14 @@ class HICRAConfig(GRPOConfig):
     )
 
     # Strategic Gram configuration
+    strategic_grams_preset: str = field(
+        default="original",
+        metadata={
+            "help": "Named preset of Strategic Grams. Supported: 'original' (HICRA paper reference "
+            "implementation seed collection), 'math', 'code'. Ignored when strategic_grams or "
+            "strategic_grams_path is set."
+        },
+    )
     strategic_grams_path: str | None = field(
         default=None,
         metadata={
