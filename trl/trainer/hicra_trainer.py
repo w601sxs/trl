@@ -45,7 +45,7 @@ from ..extras.profiling import profiling_decorator
 from .grpo_trainer import GRPOTrainer
 from .hicra_config import HICRAConfig
 from .strategic_grams import get_default_strategic_grams, load_strategic_grams_from_file
-from .utils import nanmax, nanmin
+
 
 
 logger = get_logger(__name__)
